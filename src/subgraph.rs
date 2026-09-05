@@ -1133,9 +1133,11 @@ impl Subgraph {
                 let mut is_ref = false;
                 let mut path: Vec<usize> = Vec::new();
                 let mut len = 0;
-                let mut visited: BTreeSet<Pos> = BTreeSet::new();
+                let max_steps = successors.len() * 2;
+                let mut steps = 0;
                 while let Some(pos) = curr {
-                    if !visited.insert(pos) {
+                    steps += 1;
+                    if steps > max_steps {
                         break;
                     }
                     if let Some(position) = ref_pos.as_ref() && pos == position.gbwt_pos() {

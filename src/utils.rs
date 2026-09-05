@@ -17,7 +17,11 @@ use simple_sds::binaries;
 
 /// Returns the full file name for a specific test file.
 pub fn get_test_data(filename: &'static str) -> PathBuf {
-    let mut buf = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let p = PathBuf::from("third_party/rust/gbz_base/v0_6/test-data").join(filename);
+    if p.exists() {
+        return p;
+    }
+    let mut buf = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string()));
     buf.push("test-data");
     buf.push(filename);
     buf

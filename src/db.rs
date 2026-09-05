@@ -124,8 +124,8 @@ impl GBZBase {
 
         let _ = connection.busy_timeout(std::time::Duration::from_secs(60));
         let _ = connection.execute_batch(
-            "PRAGMA mmap_size = 34359738368;
-             PRAGMA cache_size = -65536;
+            "PRAGMA mmap_size = 0;
+             PRAGMA cache_size = -262144;
              PRAGMA query_only = 1;
              PRAGMA temp_store = MEMORY;"
         );

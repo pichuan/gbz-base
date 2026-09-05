@@ -155,6 +155,30 @@ pub struct Subgraph {
 
 //-----------------------------------------------------------------------------
 
+/// An extracted haplotype walk within a subgraph.
+///
+/// Contains the reconstructed nucleotide sequence, coordinate intervals, and alignment CIGAR strings
+/// directly in memory, avoiding text-based serialization overhead (such as GFA or JSON formatting).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HaplotypeWalk {
+    /// Identifier for the haplotype walk, such as "haplotype_1", "haplotype_2", or sample name for reference.
+    pub name: String,
+    /// Contig name corresponding to the reference path or subgraph context.
+    pub contig: String,
+    /// 0-based reference start coordinate in the contig.
+    pub start: usize,
+    /// Sequence of nucleotide bases corresponding to the walk across subgraph nodes.
+    pub sequence: String,
+    /// Alignment CIGAR string relative to the reference path in the subgraph (empty if reference or disabled).
+    pub cigar: String,
+    /// Multiplicity weight if distinct paths were extracted.
+    pub weight: Option<usize>,
+    /// Whether this walk represents the reference path.
+    pub is_reference: bool,
+}
+
+//-----------------------------------------------------------------------------
+
 /// Construction.
 impl Subgraph {
     /// Creates a new empty subgraph.
@@ -1096,9 +1120,9 @@ impl Subgraph {
             }
         }
 
-        // TODO: Check for infinite loops.
         // Extract all paths and note if one of them passes through `ref_pos`.
         // `ref_offset` is the offset of the node containing `ref_pos`.
+        const MAX_PATHS: usize = 10_000;
         let mut ref_offset: Option<usize> = None;
         for (handle, positions) in successors.iter() {
             for (offset, (_, has_predecessor)) in positions.iter().enumerate() {
@@ -1109,7 +1133,11 @@ impl Subgraph {
                 let mut is_ref = false;
                 let mut path: Vec<usize> = Vec::new();
                 let mut len = 0;
+                let mut visited: BTreeSet<Pos> = BTreeSet::new();
                 while let Some(pos) = curr {
+                    if !visited.insert(pos) {
+                        break;
+                    }
                     if let Some(position) = ref_pos.as_ref() && pos == position.gbwt_pos() {
                         self.ref_id = Some(self.paths.len());
                         ref_offset = Some(path.len());
@@ -1127,6 +1155,12 @@ impl Subgraph {
                 } else if support::encoded_path_is_canonical(&path) {
                     self.paths.push(PathInfo::new(path, len));
                 }
+                if self.paths.len() >= MAX_PATHS {
+                    break;
+                }
+            }
+            if self.paths.len() >= MAX_PATHS {
+                break;
             }
         }
 
@@ -1859,6 +1893,85 @@ impl Subgraph {
         }
 
         Ok(())
+    }
+
+    /// Extracts the haplotype walks in the subgraph as structured in-memory objects.
+    ///
+    /// This method avoids the text formatting overhead of GFA or JSON serialization
+    /// by assembling the walk sequences and computing alignment CIGAR strings directly.
+    ///
+    /// # Arguments
+    ///
+    /// * `cigar`: If true, CIGAR strings aligning non-reference paths to the reference path
+    ///   are computed and populated in [`HaplotypeWalk::cigar`]. If false, the CIGAR field
+    ///   remains an empty string.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`HaplotypeWalk`] instances containing the reference walk (if present)
+    /// followed by the non-reference haplotype walks in the subgraph.
+    pub fn extract_haplotype_walks(&self, cigar: bool) -> Vec<HaplotypeWalk> {
+        let mut walks = Vec::with_capacity(self.paths.len());
+        let (ref_start, ref_contig) = if let Some(ref_path) = self.ref_path.as_ref() {
+            let start = ref_path.fragment + self.ref_interval.as_ref().map(|r| r.start).unwrap_or(0);
+            (start, ref_path.contig.clone())
+        } else {
+            (0, self.contig_name())
+        };
+
+        // Reference path first, matching write_gfa behavior.
+        if let Some((_metadata, ref_id)) = self.ref_metadata() {
+            let ref_info = &self.paths[ref_id];
+            let mut seq_bytes = Vec::with_capacity(ref_info.len);
+            for &handle in ref_info.path.iter() {
+                if let Some(record) = self.records.get(&handle) {
+                    seq_bytes.extend_from_slice(record.sequence());
+                }
+            }
+            let sequence = String::from_utf8(seq_bytes).unwrap_or_default();
+            let sample_name = self.ref_path.as_ref().map(|p| p.sample.clone()).unwrap_or_else(|| String::from("reference"));
+            walks.push(HaplotypeWalk {
+                name: sample_name,
+                contig: ref_contig.clone(),
+                start: ref_start,
+                sequence,
+                cigar: String::new(),
+                weight: ref_info.weight,
+                is_reference: true,
+            });
+        }
+
+        let mut haplotype = 1;
+        for (id, path_info) in self.paths.iter().enumerate() {
+            if Some(id) == self.ref_id {
+                continue;
+            }
+            let mut seq_bytes = Vec::with_capacity(path_info.len);
+            for &handle in path_info.path.iter() {
+                if let Some(record) = self.records.get(&handle) {
+                    seq_bytes.extend_from_slice(record.sequence());
+                }
+            }
+            let sequence = String::from_utf8(seq_bytes).unwrap_or_default();
+            let cigar_str = if cigar {
+                self.align_to_ref(id).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            walks.push(HaplotypeWalk {
+                name: format!("haplotype_{}", haplotype),
+                contig: ref_contig.clone(),
+                start: ref_start,
+                sequence,
+                cigar: cigar_str,
+                weight: path_info.weight,
+                is_reference: false,
+            });
+            haplotype += 1;
+        }
+
+        walks
     }
 
     // TODO: We cannot include graph name, as there is no header information.

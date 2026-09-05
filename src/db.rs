@@ -119,8 +119,16 @@ impl GBZBase {
     /// Returns an [`ErrorKind::InvalidData`](crate::ErrorKind::InvalidData) error if the stored header information is corrupt.
     /// Passes through any [`ErrorKind::Database`](crate::ErrorKind::Database) errors.
     pub fn open<P: AsRef<Path>>(filename: P) -> Result<Self> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
         let connection = Connection::open_with_flags(filename, flags)?;
+
+        let _ = connection.busy_timeout(std::time::Duration::from_secs(60));
+        let _ = connection.execute_batch(
+            "PRAGMA mmap_size = 34359738368;
+             PRAGMA cache_size = -65536;
+             PRAGMA query_only = 1;
+             PRAGMA temp_store = MEMORY;"
+        );
 
         // Get some header information.
         let mut get_tag = connection.prepare(

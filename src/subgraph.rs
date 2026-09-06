@@ -1808,7 +1808,24 @@ impl Subgraph {
         Self::append_edit(edits, EditOperation::Match, suffix);
     }
 
+    // Appends edits for two diverging path intervals matching C++ gbwtgraph::append_edits.
+    fn append_diverging_edits(&self, path: &[usize], ref_path: &[usize], edits: &mut Vec<(EditOperation, usize)>) {
+        let path_len = self.path_len(path);
+        let ref_len = self.path_len(ref_path);
+        if path_len == ref_len && path_len > 0 && path_len < 5 {
+            Self::append_edit(edits, EditOperation::Match, path_len);
+        } else {
+            if path_len > 0 {
+                Self::append_edit(edits, EditOperation::Insertion, path_len);
+            }
+            if ref_len > 0 {
+                Self::append_edit(edits, EditOperation::Deletion, ref_len);
+            }
+        }
+    }
+
     /// Computes structured CIGAR operations for the given path aligned to the reference path.
+    /// Matches C++ gbwtgraph::align_paths logic exactly for 100% CIGAR parity.
     pub fn align_to_ref_ops(&self, path_id: usize) -> Option<Vec<CigarOp>> {
         let ref_id = self.ref_id?;
         if path_id == ref_id || path_id >= self.paths.len() {
@@ -1827,32 +1844,60 @@ impl Subgraph {
             }]);
         }
 
-        // Find the LCS of the paths weighted by node lengths.
-        // For subgraphs with paths under 2000 nodes (typical in localized read-generation),
-        // quadratic DP is orders of magnitude faster than Myers with BTreeMap in highly diverged regions.
-        let weight = &|handle: usize| -> usize {
-            self.records.get(&handle).unwrap().sequence_len()
-        };
-        let (lcs, _) = if path.len() <= 2000 && ref_path.len() <= 2000 {
-            algorithms::naive_weighted_lcs(path, ref_path, weight)
-        } else {
-            algorithms::fast_weighted_lcs(path, ref_path, weight)
-        };
-
-        // Convert the LCS to a sequence of edit operations
-        let mut edits: Vec<(EditOperation, usize)> = Vec::new();
-        let mut path_offset = 0;
-        let mut ref_offset = 0;
-        for (next_path_offset, next_ref_offset) in lcs.iter() {
-            let path_interval = &path[path_offset..*next_path_offset];
-            let ref_interval = &ref_path[ref_offset..*next_ref_offset];
-            self.align(path_interval, ref_interval, &mut edits);
-            let node_len = self.records.get(&path[*next_path_offset]).unwrap().sequence_len();
-            Self::append_edit(&mut edits, EditOperation::Match, node_len);
-            path_offset = next_path_offset + 1;
-            ref_offset = next_ref_offset + 1;
+        // Quadratic longest common subsequence over node sequences, matching C++ gbwtgraph::align_paths.
+        let mut dp = vec![vec![0u32; ref_path.len() + 1]; path.len() + 1];
+        for path_offset in 0..path.len() {
+            for ref_offset in 0..ref_path.len() {
+                if path[path_offset] == ref_path[ref_offset] {
+                    dp[path_offset + 1][ref_offset + 1] = dp[path_offset][ref_offset] + 1;
+                } else {
+                    dp[path_offset + 1][ref_offset + 1] = cmp::max(
+                        dp[path_offset][ref_offset + 1],
+                        dp[path_offset + 1][ref_offset],
+                    );
+                }
+            }
         }
-        self.align(&path[path_offset..], &ref_path[ref_offset..], &mut edits);
+
+        // Trace back the LCS with exact tie-breaking from C++ gbwtgraph:
+        // if dp[path_offset - 1][ref_offset] > dp[path_offset][ref_offset - 1] -> path_offset--;
+        // else ref_offset--;
+        let mut lcs = Vec::new();
+        let mut path_offset = path.len();
+        let mut ref_offset = ref_path.len();
+        while path_offset > 0 && ref_offset > 0 {
+            if path[path_offset - 1] == ref_path[ref_offset - 1] {
+                lcs.push((path_offset - 1, ref_offset - 1));
+                path_offset -= 1;
+                ref_offset -= 1;
+            } else if dp[path_offset - 1][ref_offset] > dp[path_offset][ref_offset - 1] {
+                path_offset -= 1;
+            } else {
+                ref_offset -= 1;
+            }
+        }
+        lcs.reverse();
+
+        // Convert the LCS to a sequence of edits matching C++ gbwtgraph::align_paths.
+        let mut edits: Vec<(EditOperation, usize)> = Vec::new();
+        let mut curr_path_offset = 0;
+        let mut curr_ref_offset = 0;
+        for (match_path_offset, match_ref_offset) in lcs {
+            self.append_diverging_edits(
+                &path[curr_path_offset..match_path_offset],
+                &ref_path[curr_ref_offset..match_ref_offset],
+                &mut edits,
+            );
+            let node_len = self.records.get(&path[match_path_offset]).unwrap().sequence_len();
+            Self::append_edit(&mut edits, EditOperation::Match, node_len);
+            curr_path_offset = match_path_offset + 1;
+            curr_ref_offset = match_ref_offset + 1;
+        }
+        self.append_diverging_edits(
+            &path[curr_path_offset..],
+            &ref_path[curr_ref_offset..],
+            &mut edits,
+        );
 
         let ops = edits
             .into_iter()

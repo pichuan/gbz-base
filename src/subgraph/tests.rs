@@ -1400,8 +1400,12 @@ fn haplotype_walks_output() {
                 assert!(!walk.sequence.is_empty() || walk.is_reference, "Walk sequence should not be empty");
                 if cigar && subgraph.ref_id.is_some() {
                     assert!(!walk.cigar.is_empty(), "CIGAR should not be empty when enabled and ref is present");
+                    assert!(!walk.cigar_ops.is_empty(), "cigar_ops should not be empty when enabled and ref is present");
+                    let reconstructed: String = walk.cigar_ops.iter().map(|op| format!("{}{}", op.len, op.op as char)).collect();
+                    assert_eq!(reconstructed, walk.cigar, "cigar_ops reconstruction does not match cigar string");
                 } else {
                     assert!(walk.cigar.is_empty(), "CIGAR should be empty when disabled or ref is missing");
+                    assert!(walk.cigar_ops.is_empty(), "cigar_ops should be empty when disabled or ref is missing");
                 }
             }
         }

@@ -155,6 +155,16 @@ pub struct Subgraph {
 
 //-----------------------------------------------------------------------------
 
+/// A CIGAR operation with an operation type and length.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CigarOp {
+    /// CIGAR operation code: b'M', b'I', b'D', etc.
+    pub op: u8,
+    /// Length of the operation in bases.
+    pub len: u32,
+}
+
 /// An extracted haplotype walk within a subgraph.
 ///
 /// Contains the reconstructed nucleotide sequence, coordinate intervals, and alignment CIGAR strings
@@ -171,6 +181,8 @@ pub struct HaplotypeWalk {
     pub sequence: String,
     /// Alignment CIGAR string relative to the reference path in the subgraph (empty if reference or disabled).
     pub cigar: String,
+    /// Structured CIGAR operations relative to the reference path in the subgraph.
+    pub cigar_ops: Vec<CigarOp>,
     /// Multiplicity weight if distinct paths were extracted.
     pub weight: Option<usize>,
     /// Whether this walk represents the reference path.
@@ -1795,10 +1807,8 @@ impl Subgraph {
         Self::append_edit(edits, EditOperation::Match, suffix);
     }
 
-    // Returns the CIGAR string for the given path, aligned to the reference path.
-    // Takes the alignment from the LCS of the paths weighted by node lengths.
-    // Diverging parts are aligned using `align()`.
-    fn align_to_ref(&self, path_id: usize) -> Option<String> {
+    /// Computes structured CIGAR operations for the given path aligned to the reference path.
+    pub fn align_to_ref_ops(&self, path_id: usize) -> Option<Vec<CigarOp>> {
         let ref_id = self.ref_id?;
         if path_id == ref_id || path_id >= self.paths.len() {
             return None;
@@ -1827,10 +1837,28 @@ impl Subgraph {
         }
         self.align(&path[path_offset..], &ref_path[ref_offset..], &mut edits);
 
-        // Convert the edits to a CIGAR string.
+        let ops = edits
+            .into_iter()
+            .map(|(op, len)| CigarOp {
+                op: match op {
+                    EditOperation::Match => b'M',
+                    EditOperation::Insertion => b'I',
+                    EditOperation::Deletion => b'D',
+                },
+                len: len as u32,
+            })
+            .collect();
+        Some(ops)
+    }
+
+    // Returns the CIGAR string for the given path, aligned to the reference path.
+    // Takes the alignment from the LCS of the paths weighted by node lengths.
+    // Diverging parts are aligned using `align()`.
+    fn align_to_ref(&self, path_id: usize) -> Option<String> {
+        let ops = self.align_to_ref_ops(path_id)?;
         let mut result = String::new();
-        for (op, len) in edits.iter() {
-            result.push_str(&format!("{}{}", len, op));
+        for op in ops.iter() {
+            result.push_str(&format!("{}{}", op.len, op.op as char));
         }
         Some(result)
     }
@@ -1938,6 +1966,7 @@ impl Subgraph {
                 start: ref_start,
                 sequence,
                 cigar: String::new(),
+                cigar_ops: Vec::new(),
                 weight: ref_info.weight,
                 is_reference: true,
             });
@@ -1955,10 +1984,15 @@ impl Subgraph {
                 }
             }
             let sequence = String::from_utf8(seq_bytes).unwrap_or_default();
-            let cigar_str = if cigar {
-                self.align_to_ref(id).unwrap_or_default()
+            let (cigar_str, cigar_ops) = if cigar {
+                let ops = self.align_to_ref_ops(id).unwrap_or_default();
+                let mut s = String::new();
+                for op in ops.iter() {
+                    s.push_str(&format!("{}{}", op.len, op.op as char));
+                }
+                (s, ops)
             } else {
-                String::new()
+                (String::new(), Vec::new())
             };
 
             walks.push(HaplotypeWalk {
@@ -1967,6 +2001,7 @@ impl Subgraph {
                 start: ref_start,
                 sequence,
                 cigar: cigar_str,
+                cigar_ops,
                 weight: path_info.weight,
                 is_reference: false,
             });

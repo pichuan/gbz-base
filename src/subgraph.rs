@@ -1124,8 +1124,9 @@ impl Subgraph {
 
         // Mark the positions that have predecessors in the subgraph.
         for handle in keys.iter() {
-            let decompressed = successors.get(handle).unwrap().clone();
-            for (pos, _) in decompressed.iter() {
+            let n_succ = successors.get(handle).unwrap().len();
+            for i in 0..n_succ {
+                let pos = successors.get(handle).unwrap()[i].0;
                 if let Some(v) = successors.get_mut(&pos.node) {
                     v[pos.offset].1 = true;
                 }
@@ -1814,13 +1815,29 @@ impl Subgraph {
             return None;
         }
 
+        let path = &self.paths[path_id].path;
+        let ref_path = &self.paths[ref_id].path;
+
+        // Fast path: if the path is identical to the reference path, all bases match.
+        if path == ref_path {
+            let total_len = self.paths[path_id].len;
+            return Some(vec![CigarOp {
+                op: b'M',
+                len: total_len as u32,
+            }]);
+        }
+
         // Find the LCS of the paths weighted by node lengths.
+        // For subgraphs with paths under 2000 nodes (typical in localized read-generation),
+        // quadratic DP is orders of magnitude faster than Myers with BTreeMap in highly diverged regions.
         let weight = &|handle: usize| -> usize {
             self.records.get(&handle).unwrap().sequence_len()
         };
-        let path = &self.paths[path_id].path;
-        let ref_path = &self.paths[ref_id].path;
-        let (lcs, _) = algorithms::fast_weighted_lcs(path, ref_path, weight);
+        let (lcs, _) = if path.len() <= 2000 && ref_path.len() <= 2000 {
+            algorithms::naive_weighted_lcs(path, ref_path, weight)
+        } else {
+            algorithms::fast_weighted_lcs(path, ref_path, weight)
+        };
 
         // Convert the LCS to a sequence of edit operations
         let mut edits: Vec<(EditOperation, usize)> = Vec::new();

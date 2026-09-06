@@ -205,6 +205,21 @@ impl GBZBase {
     pub fn contigs(&self) -> usize {
         self.contigs
     }
+
+    /// Executes a raw SQL statement (typically a PRAGMA) on the database connection.
+    ///
+    /// This allows callers to tune SQLite settings (e.g. mmap_size) after opening
+    /// the database without modifying the default open() configuration.
+    ///
+    /// # Arguments
+    /// * `sql`: A SQL statement string to execute (e.g. "PRAGMA mmap_size = 8589934592;").
+    ///
+    /// # Errors
+    /// Passes through any database errors from the underlying SQLite connection.
+    pub fn execute_pragma(&self, sql: &str) -> Result<()> {
+        self.connection.execute_batch(sql)?;
+        Ok(())
+    }
 }
 
 //-----------------------------------------------------------------------------

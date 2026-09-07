@@ -462,6 +462,81 @@ impl Subgraph {
         self.insert_context(graph, active, context)
     }
 
+    /// Updates the subgraph to a context around the given graph position using
+    /// the legacy C++ gbwtgraph `find_subgraph` traversal algorithm.
+    ///
+    /// Unlike `around_position` which tracks Dijkstra distance separately for each
+    /// node side (`NodeSide::Left` and `NodeSide::Right`), this method performs
+    /// node-based Dijkstra matching the legacy C++ `gbwtgraph::find_subgraph`
+    /// implementation. Each node is visited at most once upon first extraction
+    /// from the priority queue, ensuring identical subgraph extraction bounds.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph`: Reference to the underlying GBZ or database graph.
+    /// * `pos`: The starting graph position (`node`, `orientation`, `offset`).
+    /// * `context`: Flanking context length in base pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if graph access fails or if the node count exceeds `limit`.
+    pub fn around_position_gbwtgraph(
+        &mut self,
+        graph: GraphReference<'_, '_>,
+        pos: GraphPosition,
+        context: usize,
+    ) -> Result<(usize, usize)> {
+        self.clear_paths();
+        let mut to_remove: BTreeSet<usize> = self.node_iter().collect();
+        let mut inserted = 0;
+        let mut graph = graph;
+
+        // C++ queue: std::priority_queue<std::pair<size_t, pos_t>, ..., std::greater>
+        // Element: Reverse((distance, node_id, is_reverse, offset))
+        let mut queue: BinaryHeap<Reverse<(usize, usize, bool, usize)>> = BinaryHeap::new();
+        queue.push(Reverse((0, pos.node, pos.orientation == Orientation::Reverse, pos.offset)));
+
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
+
+        while let Some(Reverse((cur_dist, node_id, is_rev, offset))) = queue.pop() {
+            if visited.contains(&node_id) {
+                continue;
+            }
+            visited.insert(node_id);
+            to_remove.remove(&node_id);
+            if !self.has_node(node_id) {
+                self.add_node_internal(&mut graph, node_id)?;
+                inserted += 1;
+            }
+
+            for is_reverse in [false, true] {
+                let orientation = if is_reverse { Orientation::Reverse } else { Orientation::Forward };
+                let handle = support::encode_node(node_id, orientation);
+                let record = self.record(handle).unwrap();
+                let mut distance = cur_dist;
+                if is_reverse == is_rev {
+                    distance += record.sequence_len().saturating_sub(offset);
+                } else {
+                    distance += offset + 1;
+                }
+                if distance <= context {
+                    for successor in record.successors() {
+                        let next_id = support::node_id(successor);
+                        let next_is_rev = support::node_orientation(successor) == Orientation::Reverse;
+                        queue.push(Reverse((distance, next_id, next_is_rev, 0)));
+                    }
+                }
+            }
+        }
+
+        let removed = to_remove.len();
+        for node_id in to_remove {
+            self.remove_node_internal(node_id);
+        }
+
+        Ok((inserted, removed))
+    }
+
     /// Updates the subgraph to a context around the given path interval.
     ///
     /// Reuses existing records when possible.
@@ -985,6 +1060,67 @@ impl Subgraph {
             QueryType::PathOffset(query_pos) => {
                 let reference_path = self.path_pos_from_db(graph, query_pos)?;
                 self.around_position(GraphReference::Db(graph), reference_path.0.graph_pos(), query.context())?;
+                self.extract_snarls(GraphReference::Db(graph), query.snarls(), None)?;
+                self.extract_paths(Some(reference_path), query.output())?;
+            },
+            QueryType::PathInterval(query_pos, len) => {
+                let reference_path = self.path_pos_from_db(graph, query_pos)?;
+                self.around_interval(GraphReference::Db(graph), reference_path.0, *len, query.context())?;
+                self.extract_snarls(GraphReference::Db(graph), query.snarls(), None)?;
+                self.extract_paths(Some(reference_path), query.output())?;
+            },
+            QueryType::Nodes(nodes) => {
+                if query.output() == HaplotypeOutput::ReferenceOnly {
+                    return Err(Error::invalid_query("Cannot output a reference path in a node-based query"));
+                }
+                if query.snarls() == SnarlOutput::Overlapping && nodes.len() > 1 {
+                    return Err(Error::invalid_query("Overlapping snarls cannot be extracted for a node-based query with multiple nodes"));
+                }
+                self.around_nodes(GraphReference::Db(graph), nodes, query.context())?;
+                self.extract_snarls(GraphReference::Db(graph), query.snarls(), None)?;
+                self.extract_paths(None, query.output())?;
+            },
+            QueryType::Between(start, end) => {
+                if query.output() == HaplotypeOutput::ReferenceOnly {
+                    return Err(Error::invalid_query("Cannot output a reference path in a node-based query"));
+                }
+                self.between_nodes(GraphReference::Db(graph), *start, *end)?;
+                self.extract_paths(None, query.output())?;
+            },
+        }
+
+        // Determine the stable graph name and relationships.
+        let parent = graph.graph_name()?;
+        self.compute_name(Some(&parent));
+
+        Ok(())
+    }
+
+    /// Extracts a subgraph from a database around the given query position using
+    /// the legacy C++ gbwtgraph `find_subgraph` algorithm for path queries.
+    ///
+    /// This method ensures 100% bitwise parity with the legacy C++ GbzReader
+    /// by using node-based Dijkstra graph traversal (`around_position_gbwtgraph`).
+    ///
+    /// # Arguments
+    ///
+    /// * `graph`: Mutable reference to the `GraphInterface` for database queries.
+    /// * `query`: The `SubgraphQuery` describing the position, context, and output options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query position is not found or database access fails.
+    pub fn from_db_gbwtgraph<'reference, 'graph>(
+        &mut self,
+        graph: &'reference mut GraphInterface<'graph>,
+        query: &SubgraphQuery,
+    ) -> Result<()> {
+        self.set_limit(query.limit());
+
+        match query.query_type() {
+            QueryType::PathOffset(query_pos) => {
+                let reference_path = self.path_pos_from_db(graph, query_pos)?;
+                self.around_position_gbwtgraph(GraphReference::Db(graph), reference_path.0.graph_pos(), query.context())?;
                 self.extract_snarls(GraphReference::Db(graph), query.snarls(), None)?;
                 self.extract_paths(Some(reference_path), query.output())?;
             },
@@ -1808,7 +1944,18 @@ impl Subgraph {
         Self::append_edit(edits, EditOperation::Match, suffix);
     }
 
-    // Appends edits for two diverging path intervals matching C++ gbwtgraph::append_edits.
+    /// Appends edit operations for two diverging path intervals between LCS anchor matches.
+    ///
+    /// Matches the alignment heuristic in C++ `gbwtgraph::append_edits`:
+    /// If both intervals have identical non-zero length strictly less than 5 bp,
+    /// they are treated as mismatched bases (encoded as `Match` in cigar generation).
+    /// Otherwise, insertions and deletions are appended for any non-zero length.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`: Slice of node handles representing the query path interval.
+    /// * `ref_path`: Slice of node handles representing the reference path interval.
+    /// * `edits`: Mutable vector of edit operations and lengths to append to.
     fn append_diverging_edits(&self, path: &[usize], ref_path: &[usize], edits: &mut Vec<(EditOperation, usize)>) {
         let path_len = self.path_len(path);
         let ref_len = self.path_len(ref_path);

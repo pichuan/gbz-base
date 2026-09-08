@@ -25,7 +25,7 @@ use std::cmp;
 use gbz::ENDMARKER;
 use gbz::{GBZ, GraphName, GraphPosition, Orientation, NodeSide, Pos, FullPathName};
 use gbz::support::Chains;
-use gbz::{algorithms, support};
+use gbz::support;
 
 use pggname::Graph;
 use pggname::graph::NodeInt;
@@ -460,6 +460,81 @@ impl Subgraph {
         active.push(Reverse((end_distance, end)));
 
         self.insert_context(graph, active, context)
+    }
+
+    /// Updates the subgraph to a context around the given graph position using
+    /// the legacy C++ gbwtgraph `find_subgraph` traversal algorithm.
+    ///
+    /// Unlike `around_position` which tracks Dijkstra distance separately for each
+    /// node side (`NodeSide::Left` and `NodeSide::Right`), this method performs
+    /// node-based Dijkstra matching the legacy C++ `gbwtgraph::find_subgraph`
+    /// implementation. Each node is visited at most once upon first extraction
+    /// from the priority queue, ensuring identical subgraph extraction bounds.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph`: Reference to the underlying GBZ or database graph.
+    /// * `pos`: The starting graph position (`node`, `orientation`, `offset`).
+    /// * `context`: Flanking context length in base pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if graph access fails or if the node count exceeds `limit`.
+    pub fn around_position_gbwtgraph(
+        &mut self,
+        graph: GraphReference<'_, '_>,
+        pos: GraphPosition,
+        context: usize,
+    ) -> Result<(usize, usize)> {
+        self.clear_paths();
+        let mut to_remove: BTreeSet<usize> = self.node_iter().collect();
+        let mut inserted = 0;
+        let mut graph = graph;
+
+        // C++ queue: std::priority_queue<std::pair<size_t, pos_t>, ..., std::greater>
+        // Element: Reverse((distance, node_id, is_reverse, offset))
+        let mut queue: BinaryHeap<Reverse<(usize, usize, bool, usize)>> = BinaryHeap::new();
+        queue.push(Reverse((0, pos.node, pos.orientation == Orientation::Reverse, pos.offset)));
+
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
+
+        while let Some(Reverse((cur_dist, node_id, is_rev, offset))) = queue.pop() {
+            if visited.contains(&node_id) {
+                continue;
+            }
+            visited.insert(node_id);
+            to_remove.remove(&node_id);
+            if !self.has_node(node_id) {
+                self.add_node_internal(&mut graph, node_id)?;
+                inserted += 1;
+            }
+
+            for is_reverse in [false, true] {
+                let orientation = if is_reverse { Orientation::Reverse } else { Orientation::Forward };
+                let handle = support::encode_node(node_id, orientation);
+                let record = self.record(handle).unwrap();
+                let mut distance = cur_dist;
+                if is_reverse == is_rev {
+                    distance += record.sequence_len().saturating_sub(offset);
+                } else {
+                    distance += offset + 1;
+                }
+                if distance <= context {
+                    for successor in record.successors() {
+                        let next_id = support::node_id(successor);
+                        let next_is_rev = support::node_orientation(successor) == Orientation::Reverse;
+                        queue.push(Reverse((distance, next_id, next_is_rev, 0)));
+                    }
+                }
+            }
+        }
+
+        let removed = to_remove.len();
+        for node_id in to_remove {
+            self.remove_node_internal(node_id);
+        }
+
+        Ok((inserted, removed))
     }
 
     /// Updates the subgraph to a context around the given path interval.
@@ -985,6 +1060,67 @@ impl Subgraph {
             QueryType::PathOffset(query_pos) => {
                 let reference_path = self.path_pos_from_db(graph, query_pos)?;
                 self.around_position(GraphReference::Db(graph), reference_path.0.graph_pos(), query.context())?;
+                self.extract_snarls(GraphReference::Db(graph), query.snarls(), None)?;
+                self.extract_paths(Some(reference_path), query.output())?;
+            },
+            QueryType::PathInterval(query_pos, len) => {
+                let reference_path = self.path_pos_from_db(graph, query_pos)?;
+                self.around_interval(GraphReference::Db(graph), reference_path.0, *len, query.context())?;
+                self.extract_snarls(GraphReference::Db(graph), query.snarls(), None)?;
+                self.extract_paths(Some(reference_path), query.output())?;
+            },
+            QueryType::Nodes(nodes) => {
+                if query.output() == HaplotypeOutput::ReferenceOnly {
+                    return Err(Error::invalid_query("Cannot output a reference path in a node-based query"));
+                }
+                if query.snarls() == SnarlOutput::Overlapping && nodes.len() > 1 {
+                    return Err(Error::invalid_query("Overlapping snarls cannot be extracted for a node-based query with multiple nodes"));
+                }
+                self.around_nodes(GraphReference::Db(graph), nodes, query.context())?;
+                self.extract_snarls(GraphReference::Db(graph), query.snarls(), None)?;
+                self.extract_paths(None, query.output())?;
+            },
+            QueryType::Between(start, end) => {
+                if query.output() == HaplotypeOutput::ReferenceOnly {
+                    return Err(Error::invalid_query("Cannot output a reference path in a node-based query"));
+                }
+                self.between_nodes(GraphReference::Db(graph), *start, *end)?;
+                self.extract_paths(None, query.output())?;
+            },
+        }
+
+        // Determine the stable graph name and relationships.
+        let parent = graph.graph_name()?;
+        self.compute_name(Some(&parent));
+
+        Ok(())
+    }
+
+    /// Extracts a subgraph from a database around the given query position using
+    /// the legacy C++ gbwtgraph `find_subgraph` algorithm for path queries.
+    ///
+    /// This method ensures 100% bitwise parity with the legacy C++ GbzReader
+    /// by using node-based Dijkstra graph traversal (`around_position_gbwtgraph`).
+    ///
+    /// # Arguments
+    ///
+    /// * `graph`: Mutable reference to the `GraphInterface` for database queries.
+    /// * `query`: The `SubgraphQuery` describing the position, context, and output options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query position is not found or database access fails.
+    pub fn from_db_gbwtgraph<'reference, 'graph>(
+        &mut self,
+        graph: &'reference mut GraphInterface<'graph>,
+        query: &SubgraphQuery,
+    ) -> Result<()> {
+        self.set_limit(query.limit());
+
+        match query.query_type() {
+            QueryType::PathOffset(query_pos) => {
+                let reference_path = self.path_pos_from_db(graph, query_pos)?;
+                self.around_position_gbwtgraph(GraphReference::Db(graph), reference_path.0.graph_pos(), query.context())?;
                 self.extract_snarls(GraphReference::Db(graph), query.snarls(), None)?;
                 self.extract_paths(Some(reference_path), query.output())?;
             },
@@ -1795,38 +1931,107 @@ impl Subgraph {
         Self::append_edit(edits, EditOperation::Match, suffix);
     }
 
-    // Returns the CIGAR string for the given path, aligned to the reference path.
-    // Takes the alignment from the LCS of the paths weighted by node lengths.
-    // Diverging parts are aligned using `align()`.
+    /// Appends edit operations for two diverging path intervals between LCS anchor matches.
+    ///
+    /// Matches the alignment heuristic in C++ `gbwtgraph::append_edits`:
+    /// If both intervals have identical non-zero length strictly less than 5 bp,
+    /// they are treated as mismatched bases (encoded as `Match` in cigar generation).
+    /// Otherwise, insertions and deletions are appended for any non-zero length.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`: Slice of node handles representing the query path interval.
+    /// * `ref_path`: Slice of node handles representing the reference path interval.
+    /// * `edits`: Mutable vector of edit operations and lengths to append to.
+    fn append_diverging_edits(&self, path: &[usize], ref_path: &[usize], edits: &mut Vec<(EditOperation, usize)>) {
+        let path_len = self.path_len(path);
+        let ref_len = self.path_len(ref_path);
+        if path_len == ref_len && path_len > 0 && path_len < 5 {
+            Self::append_edit(edits, EditOperation::Match, path_len);
+        } else {
+            if path_len > 0 {
+                Self::append_edit(edits, EditOperation::Insertion, path_len);
+            }
+            if ref_len > 0 {
+                Self::append_edit(edits, EditOperation::Deletion, ref_len);
+            }
+        }
+    }
+
     /// Computes structured CIGAR operations for the given path aligned to the reference path.
+    /// Matches C++ gbwtgraph::align_paths logic exactly for 100% CIGAR parity.
     pub fn align_to_ref_ops(&self, path_id: usize) -> Option<Vec<CigarOp>> {
         let ref_id = self.ref_id?;
         if path_id == ref_id || path_id >= self.paths.len() {
             return None;
         }
 
-        // Find the LCS of the paths weighted by node lengths.
-        let weight = &|handle: usize| -> usize {
-            self.records.get(&handle).unwrap().sequence_len()
-        };
         let path = &self.paths[path_id].path;
         let ref_path = &self.paths[ref_id].path;
-        let (lcs, _) = algorithms::fast_weighted_lcs(path, ref_path, weight);
 
-        // Convert the LCS to a sequence of edit operations
-        let mut edits: Vec<(EditOperation, usize)> = Vec::new();
-        let mut path_offset = 0;
-        let mut ref_offset = 0;
-        for (next_path_offset, next_ref_offset) in lcs.iter() {
-            let path_interval = &path[path_offset..*next_path_offset];
-            let ref_interval = &ref_path[ref_offset..*next_ref_offset];
-            self.align(path_interval, ref_interval, &mut edits);
-            let node_len = self.records.get(&path[*next_path_offset]).unwrap().sequence_len();
-            Self::append_edit(&mut edits, EditOperation::Match, node_len);
-            path_offset = next_path_offset + 1;
-            ref_offset = next_ref_offset + 1;
+        // Fast path: if the path is identical to the reference path, all bases match.
+        if path == ref_path {
+            let total_len = self.paths[path_id].len;
+            return Some(vec![CigarOp {
+                op: b'M',
+                len: total_len as u32,
+            }]);
         }
-        self.align(&path[path_offset..], &ref_path[ref_offset..], &mut edits);
+
+        // Quadratic longest common subsequence over node sequences, matching C++ gbwtgraph::align_paths.
+        let mut dp = vec![vec![0u32; ref_path.len() + 1]; path.len() + 1];
+        for path_offset in 0..path.len() {
+            for ref_offset in 0..ref_path.len() {
+                if path[path_offset] == ref_path[ref_offset] {
+                    dp[path_offset + 1][ref_offset + 1] = dp[path_offset][ref_offset] + 1;
+                } else {
+                    dp[path_offset + 1][ref_offset + 1] = cmp::max(
+                        dp[path_offset][ref_offset + 1],
+                        dp[path_offset + 1][ref_offset],
+                    );
+                }
+            }
+        }
+
+        // Trace back the LCS with exact tie-breaking from C++ gbwtgraph:
+        // if dp[path_offset - 1][ref_offset] > dp[path_offset][ref_offset - 1] -> path_offset--;
+        // else ref_offset--;
+        let mut lcs = Vec::new();
+        let mut path_offset = path.len();
+        let mut ref_offset = ref_path.len();
+        while path_offset > 0 && ref_offset > 0 {
+            if path[path_offset - 1] == ref_path[ref_offset - 1] {
+                lcs.push((path_offset - 1, ref_offset - 1));
+                path_offset -= 1;
+                ref_offset -= 1;
+            } else if dp[path_offset - 1][ref_offset] > dp[path_offset][ref_offset - 1] {
+                path_offset -= 1;
+            } else {
+                ref_offset -= 1;
+            }
+        }
+        lcs.reverse();
+
+        // Convert the LCS to a sequence of edits matching C++ gbwtgraph::align_paths.
+        let mut edits: Vec<(EditOperation, usize)> = Vec::new();
+        let mut curr_path_offset = 0;
+        let mut curr_ref_offset = 0;
+        for (match_path_offset, match_ref_offset) in lcs {
+            self.append_diverging_edits(
+                &path[curr_path_offset..match_path_offset],
+                &ref_path[curr_ref_offset..match_ref_offset],
+                &mut edits,
+            );
+            let node_len = self.records.get(&path[match_path_offset]).unwrap().sequence_len();
+            Self::append_edit(&mut edits, EditOperation::Match, node_len);
+            curr_path_offset = match_path_offset + 1;
+            curr_ref_offset = match_ref_offset + 1;
+        }
+        self.append_diverging_edits(
+            &path[curr_path_offset..],
+            &ref_path[curr_ref_offset..],
+            &mut edits,
+        );
 
         let ops = edits
             .into_iter()

@@ -1414,3 +1414,34 @@ fn haplotype_walks_output() {
 
 //-----------------------------------------------------------------------------
 
+/// Tests that `from_db_gbwtgraph` correctly extracts subgraphs matching
+/// ground truth path queries from an example database using node-based Dijkstra.
+#[test]
+fn gbwtgraph_compatibility_queries() {
+    let gbz_file = support::get_test_data("example.gbz");
+    let gbz_graph: GBZ = serialize::load_from(&gbz_file).unwrap();
+    let db_file = serialize::temp_file_name("gbwtgraph-compat-db");
+    let result = GBZBase::create_from_files(&gbz_file, None, &db_file);
+    assert!(result.is_ok(), "Failed to create database: {}", result.unwrap_err());
+    let mut database = GBZBase::open(&db_file).unwrap();
+    let mut graph = GraphInterface::new(&mut database).unwrap();
+
+    let (queries, truth) = queries_and_truth();
+    for (query, (true_nodes, path_count)) in queries.iter().zip(truth.iter()) {
+        if true_nodes.is_empty() {
+            continue;
+        }
+        if let QueryType::PathOffset(_) = query.query_type() {
+            let mut subgraph = Subgraph::new();
+            let res = subgraph.from_db_gbwtgraph(&mut graph, query);
+            assert!(res.is_ok(), "from_db_gbwtgraph failed for {}: {}", query, res.unwrap_err());
+            check_subgraph(&gbz_graph, &subgraph, true_nodes, *path_count, &query.to_string());
+        }
+    }
+
+    drop(graph);
+    drop(database);
+    fs::remove_file(&db_file).unwrap();
+}
+
+//-----------------------------------------------------------------------------

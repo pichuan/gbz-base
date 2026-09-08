@@ -1369,4 +1369,48 @@ fn json_output() {
     }
 }
 
+#[test]
+fn haplotype_walks_output() {
+    let (graph, path_index) = internal::load_gbz_and_create_path_index("example.gbz", GBZBase::INDEX_INTERVAL);
+    for cigar in [false, true] {
+        let (queries, _) = queries_and_gfas(cigar);
+        for query in queries.iter() {
+            let mut subgraph = Subgraph::new();
+            let _ = subgraph.from_gbz(&graph, Some(&path_index), None, query);
+            let walks = subgraph.extract_haplotype_walks(cigar);
+
+            // Verify each walk matches the paths in subgraph.
+            if let Some(ref_id) = subgraph.ref_id {
+                let ref_walk = walks.iter().find(|w| w.is_reference);
+                assert!(ref_walk.is_some(), "Reference walk missing for query {}", query);
+                let ref_walk = ref_walk.unwrap();
+                assert_eq!(ref_walk.cigar, "", "Reference walk should have empty CIGAR");
+                assert_eq!(ref_walk.sequence.len(), subgraph.paths[ref_id].len, "Reference walk sequence length mismatch");
+            }
+
+            let non_ref_walks: Vec<&HaplotypeWalk> = walks.iter().filter(|w| !w.is_reference).collect();
+            let expected_non_ref = if subgraph.ref_id.is_some() {
+                subgraph.paths.len().saturating_sub(1)
+            } else {
+                subgraph.paths.len()
+            };
+            assert_eq!(non_ref_walks.len(), expected_non_ref, "Wrong number of non-ref walks for query {}", query);
+
+            for walk in non_ref_walks {
+                assert!(!walk.sequence.is_empty() || walk.is_reference, "Walk sequence should not be empty");
+                if cigar && subgraph.ref_id.is_some() {
+                    assert!(!walk.cigar.is_empty(), "CIGAR should not be empty when enabled and ref is present");
+                    assert!(!walk.cigar_ops.is_empty(), "cigar_ops should not be empty when enabled and ref is present");
+                    let reconstructed: String = walk.cigar_ops.iter().map(|op| format!("{}{}", op.len, op.op as char)).collect();
+                    assert_eq!(reconstructed, walk.cigar, "cigar_ops reconstruction does not match cigar string");
+                } else {
+                    assert!(walk.cigar.is_empty(), "CIGAR should be empty when disabled or ref is missing");
+                    assert!(walk.cigar_ops.is_empty(), "cigar_ops should be empty when disabled or ref is missing");
+                }
+            }
+        }
+    }
+}
+
 //-----------------------------------------------------------------------------
+

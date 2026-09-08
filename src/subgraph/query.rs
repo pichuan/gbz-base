@@ -53,6 +53,29 @@ impl Display for SnarlOutput {
     }
 }
 
+/// Distance calculation heuristic for subgraph context extraction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DistanceMode {
+    /// Side-based (handle-based) Dijkstra traversal (default).
+    ///
+    /// Distances to the two sides of each node are tracked independently.
+    #[default]
+    Side,
+    /// Whole-node Dijkstra traversal.
+    ///
+    /// Each node is visited at most once upon queue extraction.
+    Node,
+}
+
+impl Display for DistanceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            DistanceMode::Side => write!(f, "side"),
+            DistanceMode::Node => write!(f, "node"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum QueryType {
     // Path name and offset in bp stored in the fragment field.
@@ -108,6 +131,9 @@ pub struct SubgraphQuery {
 
     // How to output the haplotypes.
     output: HaplotypeOutput,
+
+    // Distance calculation heuristic for context extraction.
+    distance_mode: DistanceMode,
 }
 
 impl SubgraphQuery {
@@ -119,6 +145,9 @@ impl SubgraphQuery {
 
     /// Default value for the haplotype output option.
     pub const DEFAULT_OUTPUT: HaplotypeOutput = HaplotypeOutput::All;
+
+    /// Default value for the distance calculation mode.
+    pub const DEFAULT_DISTANCE_MODE: DistanceMode = DistanceMode::Side;
 
     /// Creates a query that retrieves a subgraph around a path offset.
     ///
@@ -134,6 +163,7 @@ impl SubgraphQuery {
             context: Self::DEFAULT_CONTEXT,
             snarls: Self::DEFAULT_SNARLS,
             output: Self::DEFAULT_OUTPUT,
+            distance_mode: Self::DEFAULT_DISTANCE_MODE,
         }
     }
 
@@ -151,6 +181,7 @@ impl SubgraphQuery {
             context: Self::DEFAULT_CONTEXT,
             snarls: Self::DEFAULT_SNARLS,
             output: Self::DEFAULT_OUTPUT,
+            distance_mode: Self::DEFAULT_DISTANCE_MODE,
         }
     }
 
@@ -162,6 +193,7 @@ impl SubgraphQuery {
             context: Self::DEFAULT_CONTEXT,
             snarls: Self::DEFAULT_SNARLS,
             output: Self::DEFAULT_OUTPUT,
+            distance_mode: Self::DEFAULT_DISTANCE_MODE,
         }
     }
 
@@ -176,6 +208,7 @@ impl SubgraphQuery {
             context: Self::DEFAULT_CONTEXT,
             snarls: Self::DEFAULT_SNARLS,
             output: Self::DEFAULT_OUTPUT,
+            distance_mode: Self::DEFAULT_DISTANCE_MODE,
         }
     }
 
@@ -196,6 +229,13 @@ impl SubgraphQuery {
     /// See [`Self::DEFAULT_SNARLS`] for the default value.
     pub fn with_snarls(self, snarls: SnarlOutput) -> Self {
         SubgraphQuery { snarls, ..self }
+    }
+
+    /// Returns an updated query with the given distance calculation mode.
+    ///
+    /// See [`Self::DEFAULT_DISTANCE_MODE`] for the default value.
+    pub fn with_distance_mode(self, distance_mode: DistanceMode) -> Self {
+        SubgraphQuery { distance_mode, ..self }
     }
 
     #[deprecated(since = "0.6.0", note = "Use `with_haplotypes` instead")]
@@ -255,6 +295,11 @@ impl SubgraphQuery {
     pub fn output(&self) -> HaplotypeOutput {
         self.output
     }
+
+    /// Returns the distance calculation mode for the query.
+    pub fn distance_mode(&self) -> DistanceMode {
+        self.distance_mode
+    }
 }
 
 impl Display for SubgraphQuery {
@@ -281,6 +326,11 @@ impl Display for SubgraphQuery {
             SnarlOutput::None => write!(f, ", context {}", self.context)?,
             SnarlOutput::Contained => write!(f, ", context {} with contained snarls", self.context)?,
             SnarlOutput::Overlapping => write!(f, ", context {} with overlapping snarls", self.context)?,
+        }
+
+        // Distance mode (only if not default).
+        if self.distance_mode != DistanceMode::Side {
+            write!(f, ", distance mode {}", self.distance_mode)?;
         }
 
         // Haplotype output.

@@ -25,7 +25,7 @@ use std::cmp;
 use gbz::ENDMARKER;
 use gbz::{GBZ, GraphName, GraphPosition, Orientation, NodeSide, Pos, FullPathName};
 use gbz::support::Chains;
-use gbz::{algorithms, support};
+use gbz::support;
 
 use pggname::Graph;
 use pggname::graph::NodeInt;

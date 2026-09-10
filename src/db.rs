@@ -119,8 +119,16 @@ impl GBZBase {
     /// Returns an [`ErrorKind::InvalidData`](crate::ErrorKind::InvalidData) error if the stored header information is corrupt.
     /// Passes through any [`ErrorKind::Database`](crate::ErrorKind::Database) errors.
     pub fn open<P: AsRef<Path>>(filename: P) -> Result<Self> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
         let connection = Connection::open_with_flags(filename, flags)?;
+
+        let _ = connection.busy_timeout(std::time::Duration::from_secs(60));
+        let _ = connection.execute_batch(
+            "PRAGMA mmap_size = 0;
+             PRAGMA cache_size = -262144;
+             PRAGMA query_only = 1;
+             PRAGMA temp_store = MEMORY;"
+        );
 
         // Get some header information.
         let mut get_tag = connection.prepare(
@@ -196,6 +204,21 @@ impl GBZBase {
     /// Returns the number of contigs in path metadata.
     pub fn contigs(&self) -> usize {
         self.contigs
+    }
+
+    /// Executes an arbitrary PRAGMA SQL statement on the underlying SQLite connection.
+    ///
+    /// This allows callers to configure connection-level pragmas (e.g. `PRAGMA mmap_size = ...`).
+    ///
+    /// # Arguments
+    ///
+    /// * `sql`: A SQL statement string to execute (e.g. "PRAGMA mmap_size = 8589934592;").
+    ///
+    /// # Errors
+    /// Passes through any database errors from the underlying SQLite connection.
+    pub fn execute_pragma(&self, sql: &str) -> Result<()> {
+        self.connection.execute_batch(sql)?;
+        Ok(())
     }
 }
 

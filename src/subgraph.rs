@@ -1021,6 +1021,18 @@ impl Subgraph {
         Ok(())
     }
 
+    /// Extracts a subgraph from a database around the given query position.
+    ///
+    /// Compatibility alias for [`Self::from_db`].
+    #[inline]
+    pub fn from_db_gbwtgraph<'reference, 'graph>(
+        &mut self,
+        graph: &'reference mut GraphInterface<'graph>,
+        query: &SubgraphQuery,
+    ) -> Result<()> {
+        self.from_db(graph, query)
+    }
+
     // Returns the successor position for the given GBWT position, if it is in the subgraph.
     fn next_pos(pos: Pos, successors: &BTreeMap<usize, Vec<(Pos, bool)>>) -> Option<Pos> {
         if let Some(v) = successors.get(&pos.node) {
@@ -1124,17 +1136,18 @@ impl Subgraph {
 
         // Mark the positions that have predecessors in the subgraph.
         for handle in keys.iter() {
-            let decompressed = successors.get(handle).unwrap().clone();
-            for (pos, _) in decompressed.iter() {
+            let n_succ = successors.get(handle).unwrap().len();
+            for i in 0..n_succ {
+                let pos = successors.get(handle).unwrap()[i].0;
                 if let Some(v) = successors.get_mut(&pos.node) {
                     v[pos.offset].1 = true;
                 }
             }
         }
 
-        // TODO: Check for infinite loops.
         // Extract all paths and note if one of them passes through `ref_pos`.
         // `ref_offset` is the offset of the node containing `ref_pos`.
+        const MAX_PATHS: usize = 10_000;
         let mut ref_offset: Option<usize> = None;
         for (handle, positions) in successors.iter() {
             for (offset, (_, has_predecessor)) in positions.iter().enumerate() {
@@ -1145,7 +1158,13 @@ impl Subgraph {
                 let mut is_ref = false;
                 let mut path: Vec<usize> = Vec::new();
                 let mut len = 0;
+                let max_steps = successors.len() * 2;
+                let mut steps = 0;
                 while let Some(pos) = curr {
+                    steps += 1;
+                    if steps > max_steps {
+                        break;
+                    }
                     if let Some(position) = ref_pos.as_ref() && pos == position.gbwt_pos() {
                         self.ref_id = Some(self.paths.len());
                         ref_offset = Some(path.len());
@@ -1163,6 +1182,12 @@ impl Subgraph {
                 } else if support::encoded_path_is_canonical(&path) {
                     self.paths.push(PathInfo::new(path, len));
                 }
+                if self.paths.len() >= MAX_PATHS {
+                    break;
+                }
+            }
+            if self.paths.len() >= MAX_PATHS {
+                break;
             }
         }
 

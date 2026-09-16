@@ -1,5 +1,9 @@
 # GBZ-base releases
 
+## Current version
+
+* Query benchmark can also use GBZ graphs in addition to GBZ-bases.
+
 ## GBZ-base 0.6.1 (2026-08-24)
 
 * Support for GBZ version 3 and GBWT version 6 with Zstandard compressed BWT.

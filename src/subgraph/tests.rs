@@ -1488,3 +1488,55 @@ fn align_to_ref_special_cases() {
 
 //-----------------------------------------------------------------------------
 
+/// Tests that `from_db_gbwtgraph` and queries with `DistanceMode::Node` correctly extract
+/// subgraphs matching ground truth path queries from an example database and GBZ graph
+/// using node-based Dijkstra.
+#[test]
+fn gbwtgraph_compatibility_queries() {
+    let (gbz_graph, path_index) = internal::load_gbz_and_create_path_index("example.gbz", GBZBase::INDEX_INTERVAL);
+    let gbz_file = support::get_test_data("example.gbz");
+    let db_file = serialize::temp_file_name("gbwtgraph-compat-db");
+    let result = GBZBase::create_from_files(&gbz_file, None, &db_file);
+    assert!(result.is_ok(), "Failed to create database: {}", result.unwrap_err());
+    let database = GBZBase::open(&db_file).unwrap();
+    let mut graph = GraphInterface::new(&database).unwrap();
+
+    let (queries, truth) = queries_and_truth();
+    for (query, (true_nodes, path_count)) in queries.iter().zip(truth.iter()) {
+        assert_eq!(query.distance_mode(), DistanceMode::Side, "Default distance mode should be Side");
+        if true_nodes.is_empty() {
+            continue;
+        }
+        if let QueryType::PathOffset(_) = query.query_type() {
+            // Test 1: legacy from_db_gbwtgraph alias
+            let mut subgraph = Subgraph::new();
+            let res = subgraph.from_db_gbwtgraph(&mut graph, query);
+            assert!(res.is_ok(), "from_db_gbwtgraph failed for {}: {}", query, res.unwrap_err());
+            check_subgraph(&gbz_graph, &subgraph, true_nodes, *path_count, &query.to_string());
+
+            // Test 2: from_db with explicit DistanceMode::Node
+            let node_query = query.clone().with_distance_mode(DistanceMode::Node);
+            assert_eq!(node_query.distance_mode(), DistanceMode::Node);
+            let mut subgraph_node = Subgraph::new();
+            let res2 = subgraph_node.from_db(&mut graph, &node_query);
+            assert!(res2.is_ok(), "from_db with DistanceMode::Node failed for {}: {}", node_query, res2.unwrap_err());
+            check_subgraph(&gbz_graph, &subgraph_node, true_nodes, *path_count, &node_query.to_string());
+
+            // Both methods must produce identical subgraphs
+            assert_eq!(subgraph.nodes(), subgraph_node.nodes());
+            assert_eq!(subgraph.paths(), subgraph_node.paths());
+
+            // Test 3: from_gbz with explicit DistanceMode::Node
+            let mut subgraph_gbz = Subgraph::new();
+            let res3 = subgraph_gbz.from_gbz(&gbz_graph, Some(&path_index), None, &node_query);
+            assert!(res3.is_ok(), "from_gbz with DistanceMode::Node failed for {}: {}", node_query, res3.unwrap_err());
+            check_subgraph(&gbz_graph, &subgraph_gbz, true_nodes, *path_count, &node_query.to_string());
+        }
+    }
+
+    drop(graph);
+    drop(database);
+    fs::remove_file(&db_file).unwrap();
+}
+
+//-----------------------------------------------------------------------------

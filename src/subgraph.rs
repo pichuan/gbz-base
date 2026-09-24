@@ -140,6 +140,9 @@ pub struct Subgraph {
     // Distance calculation heuristic for context extraction.
     distance_mode: DistanceMode,
 
+    // Algorithm for aligning paths to the reference path.
+    alignment_mode: AlignmentMode,
+
     // Paths in the subgraph.
     paths: Vec<PathInfo>,
 
@@ -154,6 +157,34 @@ pub struct Subgraph {
 
     // Stable graph name.
     graph_name: Option<GraphName>,
+}
+
+//-----------------------------------------------------------------------------
+
+/// Algorithm used by [`Subgraph::align_to_ref`] for aligning paths to the reference path.
+///
+/// # Examples
+///
+/// ```
+/// use gbz_base::{AlignmentMode, Subgraph};
+///
+/// let mut subgraph = Subgraph::new();
+/// assert_eq!(subgraph.alignment_mode(), AlignmentMode::WeightedLcs);
+/// subgraph.set_alignment_mode(AlignmentMode::Gbwtgraph);
+/// assert_eq!(subgraph.alignment_mode(), AlignmentMode::Gbwtgraph);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AlignmentMode {
+    /// LCS of the paths weighted by node lengths, with diverging parts aligned
+    /// using vg-style scoring (default).
+    #[default]
+    WeightedLcs,
+    /// Reproduces `gbwtgraph::align_paths` in the C++ implementation exactly:
+    /// unweighted LCS over nodes, and diverging parts become a mismatch if both
+    /// sides have the same length below 5 bp, or an insertion + deletion otherwise.
+    ///
+    /// Use this for output identical to the C++ `gbwtgraph` subgraph CIGARs.
+    Gbwtgraph,
 }
 
 //-----------------------------------------------------------------------------
@@ -286,6 +317,16 @@ impl Subgraph {
     /// Returns the distance calculation heuristic used for context extraction.
     pub fn distance_mode(&self) -> DistanceMode {
         self.distance_mode
+    }
+
+    /// Sets the algorithm used by [`Self::align_to_ref`] and CIGAR output.
+    pub fn set_alignment_mode(&mut self, alignment_mode: AlignmentMode) {
+        self.alignment_mode = alignment_mode;
+    }
+
+    /// Returns the algorithm used by [`Self::align_to_ref`] and CIGAR output.
+    pub fn alignment_mode(&self) -> AlignmentMode {
+        self.alignment_mode
     }
 
     /// Returns the path position for the haplotype offset represented by the query position.
@@ -1929,20 +1970,93 @@ impl Subgraph {
     ///
     /// Returns [`None`] if there is no reference path, if `path_id` is the reference path,
     /// or if there is no path with the given identifier.
-    /// The alignment is taken from the LCS of the paths weighted by node lengths,
-    /// and the diverging parts are aligned heuristically.
+    /// The algorithm is chosen with [`Self::set_alignment_mode`]; see [`AlignmentMode`].
     pub fn align_to_ref(&self, path_id: usize) -> Option<Vec<CigarOp>> {
         let ref_id = self.ref_id?;
         if path_id == ref_id || path_id >= self.paths.len() {
             return None;
         }
+        let path = &self.paths[path_id].path;
+        let ref_path = &self.paths[ref_id].path;
+        match self.alignment_mode {
+            AlignmentMode::WeightedLcs => Some(self.align_weighted_lcs(path, ref_path)),
+            AlignmentMode::Gbwtgraph => Some(self.align_gbwtgraph(path, ref_path)),
+        }
+    }
 
+    // Aligns `path` to `ref_path` as C++ `gbwtgraph::align_paths` does.
+    fn align_gbwtgraph(&self, path: &[usize], ref_path: &[usize]) -> Vec<CigarOp> {
+        Self::gbwtgraph_alignment(path, ref_path, |handle| {
+            self.records.get(&handle).unwrap().sequence_len()
+        })
+    }
+
+    // Returns the alignment of `path` to `ref_path` computed exactly as in C++
+    // `gbwtgraph::align_paths`, where `node_len` returns the sequence length of a handle.
+    //
+    // Uses the unweighted quadratic LCS over node handles, and traces it back from the end,
+    // preferring to skip a node of `path` only if that keeps a strictly longer LCS.
+    // Each diverging part between LCS nodes becomes a mismatch if both sides have the
+    // same length in 1..5 bp, and an insertion followed by a deletion otherwise.
+    fn gbwtgraph_alignment<F: Fn(usize) -> usize>(path: &[usize], ref_path: &[usize], node_len: F) -> Vec<CigarOp> {
+        let cols = ref_path.len() + 1;
+        let mut dp = vec![0u32; (path.len() + 1) * cols];
+        for i in 0..path.len() {
+            for j in 0..ref_path.len() {
+                dp[(i + 1) * cols + j + 1] = if path[i] == ref_path[j] {
+                    dp[i * cols + j] + 1
+                } else {
+                    cmp::max(dp[i * cols + j + 1], dp[(i + 1) * cols + j])
+                };
+            }
+        }
+
+        let mut lcs: Vec<(usize, usize)> = Vec::new();
+        let (mut i, mut j) = (path.len(), ref_path.len());
+        while i > 0 && j > 0 {
+            if path[i - 1] == ref_path[j - 1] {
+                lcs.push((i - 1, j - 1));
+                i -= 1;
+                j -= 1;
+            } else if dp[(i - 1) * cols + j] > dp[i * cols + j - 1] {
+                i -= 1;
+            } else {
+                j -= 1;
+            }
+        }
+        lcs.reverse();
+
+        let interval_len = |handles: &[usize]| -> usize { handles.iter().map(|&h| node_len(h)).sum() };
+        let append_diverging = |path: &[usize], ref_path: &[usize], ops: &mut Vec<CigarOp>| {
+            let path_len = interval_len(path);
+            let ref_len = interval_len(ref_path);
+            if path_len == ref_len && path_len > 0 && path_len < 5 {
+                Self::append_op(ops, CigarOp::r#match(path_len));
+            } else {
+                Self::append_op(ops, CigarOp::insertion(path_len));
+                Self::append_op(ops, CigarOp::deletion(ref_len));
+            }
+        };
+
+        let mut ops: Vec<CigarOp> = Vec::new();
+        let (mut path_offset, mut ref_offset) = (0, 0);
+        for (next_path_offset, next_ref_offset) in lcs {
+            append_diverging(&path[path_offset..next_path_offset], &ref_path[ref_offset..next_ref_offset], &mut ops);
+            Self::append_op(&mut ops, CigarOp::r#match(node_len(path[next_path_offset])));
+            path_offset = next_path_offset + 1;
+            ref_offset = next_ref_offset + 1;
+        }
+        append_diverging(&path[path_offset..], &ref_path[ref_offset..], &mut ops);
+        ops
+    }
+
+    // Aligns `path` to `ref_path` using the LCS weighted by node lengths,
+    // with the diverging parts aligned heuristically by `align`.
+    fn align_weighted_lcs(&self, path: &[usize], ref_path: &[usize]) -> Vec<CigarOp> {
         // Find the LCS of the paths weighted by node lengths.
         let weight = &|handle: usize| -> usize {
             self.records.get(&handle).unwrap().sequence_len()
         };
-        let path = &self.paths[path_id].path;
-        let ref_path = &self.paths[ref_id].path;
         let (lcs, _) = algorithms::fast_weighted_lcs(path, ref_path, weight);
 
         // Convert the LCS to a sequence of CIGAR operations.
@@ -1960,7 +2074,7 @@ impl Subgraph {
         }
         self.align(&path[path_offset..], &ref_path[ref_offset..], &mut ops);
 
-        Some(ops)
+        ops
     }
 
     // Returns the CIGAR string for the given path, aligned to the reference path.

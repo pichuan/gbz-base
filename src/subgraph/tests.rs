@@ -1676,5 +1676,85 @@ fn align_to_ref_special_cases() {
     }
 }
 
+// Node lengths for the synthetic `gbwtgraph_alignment` tests: handle `h` has length `h % 10`,
+// except handles `>= 100`, which have length `h - 100`.
+fn synthetic_len(handle: usize) -> usize {
+    if handle >= 100 { handle - 100 } else { handle % 10 }
+}
+
+fn gbwtgraph_cigar(path: &[usize], ref_path: &[usize]) -> String {
+    CigarOp::cigar_string(&Subgraph::gbwtgraph_alignment(path, ref_path, synthetic_len))
+}
+
+#[test]
+fn gbwtgraph_alignment_matches_cpp_rules() {
+    // Identical paths are a single match.
+    assert_eq!(gbwtgraph_cigar(&[2, 3, 4], &[2, 3, 4]), "9M", "Wrong CIGAR for identical paths");
+
+    // A short diverging part of equal length (1..5 bp) is a mismatch.
+    assert_eq!(gbwtgraph_cigar(&[1, 11, 1], &[1, 21, 1]), "3M", "Wrong CIGAR for a 1 bp mismatch");
+    assert_eq!(gbwtgraph_cigar(&[1, 104, 1], &[1, 4, 1]), "6M", "Wrong CIGAR for a 4 bp mismatch");
+
+    // An equal-length diverging part of 5 bp or more is an insertion + deletion.
+    assert_eq!(gbwtgraph_cigar(&[1, 5, 1], &[1, 15, 1]), "1M5I5D1M", "Wrong CIGAR for a 5 bp divergence");
+
+    // Different lengths are always insertion + deletion, and empty sides are omitted.
+    assert_eq!(gbwtgraph_cigar(&[1, 2, 1], &[1, 13, 1]), "1M2I3D1M", "Wrong CIGAR for unequal lengths");
+    assert_eq!(gbwtgraph_cigar(&[1, 2, 1], &[1, 1]), "1M2I1M", "Wrong CIGAR for an insertion");
+    assert_eq!(gbwtgraph_cigar(&[1, 1], &[1, 3, 1]), "1M3D1M", "Wrong CIGAR for a deletion");
+
+    // Diverging ends and empty paths.
+    assert_eq!(gbwtgraph_cigar(&[2, 1], &[3, 1]), "2I3D1M", "Wrong CIGAR for a diverging start");
+    assert_eq!(gbwtgraph_cigar(&[], &[3]), "3D", "Wrong CIGAR for an empty path");
+    assert_eq!(gbwtgraph_cigar(&[3], &[]), "3I", "Wrong CIGAR for an empty reference");
+}
+
+#[test]
+fn gbwtgraph_alignment_tie_breaking() {
+    // Both [1, 2, 4] and [1, 3, 4] are longest common subsequences. The C++ traceback
+    // skips a reference node on ties, so it keeps node 3 and aligns node 2 as indels.
+    assert_eq!(gbwtgraph_cigar(&[1, 2, 3, 4], &[1, 3, 2, 4]), "1M2I3M2D4M", "Wrong tie-breaking");
+
+    // The LCS is unweighted: two short shared nodes beat one long shared node,
+    // unlike the weighted LCS used by `AlignmentMode::WeightedLcs`.
+    assert_eq!(gbwtgraph_cigar(&[1, 150, 2, 3], &[2, 3, 150]), "51I5M50D", "Wrong CIGAR for unweighted LCS");
+}
+
+#[test]
+fn alignment_modes() {
+    let (graph, path_index) = internal::load_gbz_and_create_path_index("example.gbz", GBZBase::INDEX_INTERVAL);
+    let path_a = FullPathName::generic("A");
+    let query = SubgraphQuery::path_offset(&path_a, 2).with_context(3).with_haplotypes(HaplotypeOutput::All);
+    let mut subgraph = Subgraph::new();
+    assert!(subgraph.from_gbz(&graph, Some(&path_index), None, &query).is_ok(), "Failed to extract the subgraph");
+    assert_eq!(subgraph.alignment_mode(), AlignmentMode::WeightedLcs, "Wrong default alignment mode");
+
+    let ref_id = subgraph.ref_id.unwrap();
+    let weighted: Vec<_> = (0..subgraph.paths()).map(|id| subgraph.align_to_ref(id)).collect();
+    subgraph.set_alignment_mode(AlignmentMode::Gbwtgraph);
+    assert_eq!(subgraph.alignment_mode(), AlignmentMode::Gbwtgraph, "Alignment mode was not set");
+    for (id, weighted_ops) in weighted.iter().enumerate() {
+        let ops = subgraph.align_to_ref(id);
+        if id == ref_id {
+            assert!(ops.is_none(), "Got an alignment for the reference path");
+            continue;
+        }
+        let ops = ops.unwrap();
+        let weighted_ops = weighted_ops.as_ref().unwrap();
+        // Both modes must describe the same path and reference lengths.
+        let consumed = |ops: &[CigarOp], codes: &[u8]| -> usize {
+            ops.iter().filter(|op| codes.contains(&op.op)).map(|op| op.len).sum()
+        };
+        assert_eq!(consumed(&ops, b"MI"), consumed(weighted_ops, b"MI"), "Wrong path length for path {}", id);
+        assert_eq!(consumed(&ops, b"MD"), consumed(weighted_ops, b"MD"), "Wrong reference length for path {}", id);
+    }
+    assert!(subgraph.align_to_ref(subgraph.paths()).is_none(), "Got an alignment for a nonexistent path");
+
+    // Walks use the selected mode.
+    for walk in subgraph.extract_haplotype_walks(true) {
+        assert_eq!(walk.cigar.is_some(), !walk.is_reference, "Wrong CIGAR presence in walk");
+    }
+}
+
 //-----------------------------------------------------------------------------
 
